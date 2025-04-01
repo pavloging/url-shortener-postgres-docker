@@ -1,56 +1,110 @@
 package main
 
 import (
-	"context"
-	"fmt"
-	"log"
+	"log/slog"
+	"net/http"
 	"os"
+	"url-shortener/internal/config"
+	"url-shortener/internal/lib/logger/handlers/slogpretty"
+	"url-shortener/internal/lib/logger/sl"
+	"url-shortener/internal/storage/postgres"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/joho/godotenv"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"url-shortener/internal/http-server/handlers/redirect"
+	"url-shortener/internal/http-server/handlers/url/delete"
+	"url-shortener/internal/http-server/handlers/url/save"
+	"url-shortener/internal/http-server/handlers/url/update"
+	mwLogger "url-shortener/internal/http-server/middleware/logger"
+)
+
+const (
+	envLocal = "local"
+	envProd  = "prod"
 )
 
 func main() {
-	err := godotenv.Load()
+	// Get environment
+	cfg := config.MustLoad()
+
+	// Settings logger
+	log := setupLogger(cfg.Env)
+	log.Info("starting the project...", slog.String("env", cfg.Env), slog.String("version", "v1"))
+	log.Debug("debug messages are enabled")
+	log.Error("error messages are enabled")
+
+	// Settings and started database
+	storage, err := postgres.New(cfg.DatabaseURL)
 	if err != nil {
-		log.Fatal("Error loading .env file")
+		log.Error("failed to init storage", sl.Err(err))
+		os.Exit(1)
+	}
+	defer storage.Close()
+
+	// Init router
+	router := chi.NewRouter()
+
+	// Middlewares
+	router.Use(middleware.RequestID) // Хороший middleware для логирования
+	router.Use(mwLogger.New(log))    // Хороший middleware для логирования (custom)
+	router.Use(middleware.Logger)    // Логирует все входящие запросы
+	router.Use(middleware.Recoverer) // Перехватывает паники и возвращает 500
+	router.Use(middleware.URLFormat) // Для красивых URL при подключении к обработчикам
+
+	// Handlers with Auth
+	router.Route("/url", func(r chi.Router) {
+		r.Use(middleware.BasicAuth("url-shortener", map[string]string{
+			cfg.Auth.User: cfg.Auth.Password,
+		}))
+
+		r.Post("/", save.New(log, storage))
+		r.Put("/", update.New(log, storage))
+		r.Delete("/{alias}", delete.New(log, storage))
+	})
+
+	// Handlers without Auth
+	router.Get("/{alias}", redirect.New(log, storage))
+
+	log.Info("starting server", slog.String("address", cfg.Address))
+
+	// Settings and started server
+	srv := &http.Server{
+		Addr:         cfg.Address,
+		Handler:      router,
+		ReadTimeout:  cfg.HTTPServer.Timeout,
+		WriteTimeout: cfg.HTTPServer.Timeout,
+		IdleTimeout:  cfg.HTTPServer.IdleTimeout,
 	}
 
-	// Подключение к новой БД shortener
-	db, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatalf("Unable to connect to database: %v\n", err)
-	}
-	defer db.Close(context.Background())
-
-	// Создание таблиц в новой БД
-	_, err = db.Exec(context.Background(), `
-		CREATE TABLE IF NOT EXISTS url (
-			id SERIAL PRIMARY KEY,
-			alias TEXT NOT NULL UNIQUE,
-			url TEXT NOT NULL,
-			created_at TIMESTAMP DEFAULT NOW()
-		);
-		CREATE INDEX IF NOT EXISTS idx_alias ON url(alias);
-	`)
-	if err != nil {
-		log.Fatalf("Cannot create table: %v\n", err)
+	if err := srv.ListenAndServe(); err != nil {
+		log.Error("failed to start server")
 	}
 
-	// Умная вставка с обработкой дубликатов
-	var insertedID int
-	err = db.QueryRow(
-		context.Background(),
-		`INSERT INTO url(alias, url) VALUES($1, $2)
-		 ON CONFLICT (alias) DO UPDATE SET url = EXCLUDED.url
-		 RETURNING id`,
-		"example123r",
-		"https://example12r345.com",
-	).Scan(&insertedID)
+	log.Info("server stopped")
+}
 
-	if err != nil {
-		log.Fatalf("Insert failed: %v\n", err)
+func setupLogger(env string) *slog.Logger {
+	var log *slog.Logger
+
+	switch env {
+	case envLocal:
+		log = setupPrettySlog() // Для локальный разработки - самописный logger
+	case envProd:
+		log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
 
-	fmt.Printf("Operation completed successfully! ID: %d\n", insertedID)
+	return log
+}
+
+func setupPrettySlog() *slog.Logger {
+	opts := slogpretty.PrettyHandlerOptions{
+		SlogOpts: &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		},
+	}
+
+	handler := opts.NewPrettyHandler(os.Stdout)
+
+	return slog.New(handler)
 }
