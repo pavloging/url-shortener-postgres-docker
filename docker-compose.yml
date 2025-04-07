@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+    shortener:
+        build: ./shortener
+        image: shortener
+        ports:
+            - 8080:8080
+        restart: always
+        env_file:
+          - .env  # Для секретных данных
+        logging:
+            driver: 'json-file'
+
+    db:
+        image: postgres:17.2
+        ports:
+          - "${DB_PORT}:5432"  # Пробрасываем порт хоста
+        restart: always
+        environment:  # Явно передаём только нужные PostgreSQL переменные
+          POSTGRES_USER: ${POSTGRES_USER}
+          POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+          POSTGRES_DB: ${POSTGRES_DB}
+        volumes:
+            - ./pgdata:/var/lib/postgresql/data
+
+    # db:
+    #     image: postgres:17.2
+    #     ports:
+    #         - '5434:5432' # 5432:5432
+    #     restart: always
+    #     env_file:
+    #       - .env  # Для секретных данных
+    #     # Можно вот так, но пароли в открытом виде
+    #     # environment:
+    #     #     POSTGRES_USER: root
+    #     #     POSTGRES_PASSWORD: fA63hv9nDnfaq318fb
+    #     #     POSTGRES_DB: shortener
+    #     volumes:
+    #         - ./pgdata:/var/lib/postgresql/data
